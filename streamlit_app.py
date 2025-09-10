@@ -1,159 +1,132 @@
-# streamlit_ipo_hype_dashboard.py
-# Streamlit dashboard for IPO Hype Scores
-# Reads sqlite DB 'ipo_hype.db' (created by the prototype). If missing, the app will create a demo DB with sample data.
-
-import streamlit as st
-import pandas as pd
+# ipo_hype_mvp.py
+# Run: python ipo_hype_mvp.py
 import sqlite3
-from datetime import datetime, timedelta
-import altair as alt
+import time
 import math
+from datetime import datetime, timedelta
+import requests
+from collections import defaultdict
+import random
 
-DB_PATH = "ipo_hype.db"
+# ---------- Config ----------
+WINDOW_MINUTES = 60
+DB = "ipo_hype.db"
 
-# -------------------- DB utilities --------------------
-
-def get_conn(path=DB_PATH):
-    return sqlite3.connect(path, check_same_thread=False)
-
-
-def ensure_demo_db(conn):
-    """Creates schema and inserts demo data if tables are missing or empty."""
+# ---------- Utilities ----------
+def ensure_db():
+    conn = sqlite3.connect(DB)
     c = conn.cursor()
-    # Create tables if not exist
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS ipos (
+    c.execute("""CREATE TABLE IF NOT EXISTS ipos (
         id INTEGER PRIMARY KEY AUTOINCREMENT, company TEXT, ticker TEXT, expected_date TEXT, created_at TEXT
     )""")
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS social_posts (
+    c.execute("""CREATE TABLE IF NOT EXISTS social_posts (
         id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT, author_id TEXT, author_followers INTEGER,
         text TEXT, created_at TEXT, ipo_id INTEGER, likes INTEGER, shares INTEGER, comments INTEGER,
         sentiment REAL, bot_score REAL
     )""")
-    c.execute("""
-    CREATE TABLE IF NOT EXISTS hype_scores (
+    c.execute("""CREATE TABLE IF NOT EXISTS hype_scores (
         id INTEGER PRIMARY KEY AUTOINCREMENT, ipo_id INTEGER, window_start TEXT, window_end TEXT,
         volume INTEGER, avg_sentiment REAL, influencer_score REAL, engagement_score REAL,
         bot_penalty REAL, hype_score REAL, created_at TEXT
     )""")
     conn.commit()
-
-    # If no IPOs, insert demo IPO and posts
-    ipos_df = pd.read_sql_query("SELECT * FROM ipos LIMIT 1", conn)
-    if ipos_df.empty:
-        now = datetime.utcnow()
-        c.execute("INSERT INTO ipos(company, ticker, expected_date, created_at) VALUES (?,?,?,?)",
-                  ("Acme Robotics", "ACMR", (now + timedelta(days=7)).date().isoformat(), now.isoformat()))
-        ipo_id = c.lastrowid
-
-        # create synthetic hype score rows
-        import random
-        for h in range(48):
-            window_end = now - timedelta(hours=47-h)
-            window_start = window_end - timedelta(hours=1)
-            volume = random.randint(2,40)
-            avg_sentiment = random.uniform(-0.3, 0.9)
-            influencer_score = random.uniform(1, 60)
-            engagement_score = random.uniform(0.1, 10)
-            bot_penalty = random.uniform(0.0, 0.6)
-            hype_score = max(0.0, min(1.0, 0.3*min(1, math.log1p(volume)/5.0) + 0.2*(influencer_score/50.0) + 0.2*(engagement_score/10.0) + 0.15*max(0,avg_sentiment) - 0.25*bot_penalty))
-            c.execute("""
-            INSERT INTO hype_scores(ipo_id, window_start, window_end, volume, avg_sentiment, influencer_score, engagement_score, bot_penalty, hype_score, created_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?)
-            """, (ipo_id, window_start.isoformat(), window_end.isoformat(), volume, avg_sentiment, influencer_score, engagement_score, bot_penalty, hype_score, window_end.isoformat()))
-
-        conn.commit()
-
-
-# -------------------- Simple analysis utilities --------------------
-
-def zscore_normalization(series):
-    if series.std() == 0:
-        return pd.Series([50.0]*len(series), index=series.index)
-    z = (series - series.mean()) / series.std()
-    scaled = 50 + 10*z  # center at 50, scale by std dev
-    return scaled.clip(0,100)
-
-
-# -------------------- Data loading --------------------
-
-def load_ipos(conn):
-    return pd.read_sql_query("SELECT * FROM ipos ORDER BY created_at DESC", conn)
-
-
-def load_hype_scores(conn, ipo_id=None, since_days=7):
-    q = "SELECT * FROM hype_scores"
-    params = []
-    if ipo_id is not None:
-        q += " WHERE ipo_id = ?"
-        params.append(ipo_id)
-    q += " ORDER BY window_end ASC"
-    df = pd.read_sql_query(q, conn, params=params)
-    if not df.empty:
-        df['window_end'] = pd.to_datetime(df['window_end'])
-        df['window_start'] = pd.to_datetime(df['window_start'])
-    return df
-
-
-# -------------------- Streamlit UI --------------------
-
-def main():
-    st.set_page_config(page_title="IPO Hype Dashboard", layout="wide")
-    st.title("IPO Hype Dashboard")
-
-    conn = get_conn()
-    ensure_demo_db(conn)
-
-    # Sidebar controls
-    st.sidebar.header("Filters")
-    ipos_df = load_ipos(conn)
-    ipo_map = {f"{r['company']} ({r['ticker']})": int(r['id']) for _, r in ipos_df.iterrows()} if not ipos_df.empty else {}
-    ipo_choice = st.sidebar.selectbox("Select IPO", options=["All"] + list(ipo_map.keys()))
-    date_range_days = st.sidebar.slider("Show last N days", min_value=1, max_value=30, value=7)
-
-    # Main layout
-    st.subheader("Hype Score Timeline (0-100, z-score normalized)")
-    if ipo_choice == "All":
-        hs_df = load_hype_scores(conn)
-    else:
-        hs_df = load_hype_scores(conn, ipo_id=ipo_map[ipo_choice])
-
-    if hs_df.empty:
-        st.info("No hype scores found.")
-    else:
-        cutoff = pd.Timestamp.utcnow() - pd.Timedelta(days=date_range_days)
-        hs_df = hs_df[hs_df['window_end'] >= cutoff]
-
-        if hs_df.empty:
-            st.info("No data in selected date range.")
-        else:
-            # Convert hype_score (0-1) to 0-100, then normalize with z-score baseline
-            hs_df['hype_raw'] = hs_df['hype_score'] * 100
-            hs_df['hype_norm'] = zscore_normalization(hs_df['hype_raw'])
-
-            if ipo_choice == "All":
-                chart_df = hs_df.groupby('window_end').hype_norm.mean().reset_index()
-                chart_df.rename(columns={'hype_norm': 'HypeScore'}, inplace=True)
-            else:
-                chart_df = hs_df[['window_end','hype_norm']].rename(columns={'hype_norm':'HypeScore'})
-
-            line = alt.Chart(chart_df).mark_line(point=True).encode(
-                x=alt.X('window_end:T', title='Time'),
-                y=alt.Y('HypeScore:Q', title='Hype Score (0-100, z-score)'),
-                tooltip=[alt.Tooltip('window_end:T', title='Time'), alt.Tooltip('HypeScore:Q', title='Score')]
-            ).interactive()
-
-            st.altair_chart(line, use_container_width=True)
-
-            # Latest metrics
-            latest = hs_df.sort_values('window_end').iloc[-1]
-            col_a, col_b = st.columns(2)
-            col_a.metric("Latest Raw Hype", f"{latest['hype_raw']:.1f}")
-            col_b.metric("Normalized Hype", f"{latest['hype_norm']:.1f}")
-
     conn.close()
 
+# ---------- Simple sentiment (placeholder) ----------
+def simple_sentiment(text):
+    # placeholder: rudimentary sentiment by counting words. Replace with model (VADER or transformer)
+    pos = sum(1 for w in text.lower().split() if w in ("good","great","awesome","up","bull","love","moon"))
+    neg = sum(1 for w in text.lower().split() if w in ("bad","terrible","down","sell","scam","bear"))
+    score = (pos - neg) / max(1, pos + neg)
+    return score
 
-if __name__ == '__main__':
-    main()
+# ---------- Bot score (placeholder) ----------
+def simple_bot_score(author_followers, account_age_days=365, posts_per_day=1):
+    score = 0.0
+    if author_followers < 50: score += 0.4
+    if posts_per_day > 50: score += 0.4
+    if account_age_days < 30: score += 0.2
+    return min(1.0, score)
+
+# ---------- Ingestion (MVP: generate synthetic social posts) ----------
+def ingest_dummy_posts(ipo):
+    # Replace with API calls: X, Reddit, StockTwits, etc.
+    texts = [
+        f"{ipo['ticker']} looks great, I'm bullish!",
+        f"Heard {ipo['company']} IPO next week. pump?",
+        f"Stay away from {ipo['ticker']} scam.",
+        f"{ipo['company']} S-1 filed. news article: ...",
+    ]
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    for i in range(random.randint(10,40)):
+        text = random.choice(texts)
+        followers = random.choice([10,50,200,5000,20000])
+        sent = simple_sentiment(text)
+        bot = simple_bot_score(followers, account_age_days=random.choice([10,100,500]), posts_per_day=random.choice([1,5,100]))
+        likes = random.randint(0,500)
+        shares = random.randint(0,200)
+        comments = random.randint(0,100)
+        created_at = datetime.utcnow().isoformat()
+        c.execute("""INSERT INTO social_posts(platform, author_id, author_followers, text, created_at, ipo_id, likes, shares, comments, sentiment, bot_score)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                  ("dummy", f"user_{random.randint(1,10000)}", followers, text, created_at, ipo['id'], likes, shares, comments, sent, bot))
+    conn.commit()
+    conn.close()
+
+# ---------- Hype calculation ----------
+def compute_hype_for_ipo(ipo_id, window_minutes=WINDOW_MINUTES):
+    now = datetime.utcnow()
+    start = now - timedelta(minutes=window_minutes)
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("SELECT likes, shares, comments, author_followers, sentiment, bot_score FROM social_posts WHERE ipo_id=? AND created_at >= ?", (ipo_id, start.isoformat()))
+    rows = c.fetchall()
+    if not rows:
+        conn.close()
+        return None
+    volume = len(rows)
+    total_engagement = sum((r[0] + r[1] + r[2]) for r in rows)
+    avg_sentiment = sum(r[4] for r in rows) / volume
+    influencer_score = sum(math.sqrt(max(1,r[3])) for r in rows) / volume
+    engagement_score = (math.log1p(total_engagement) / (1 + math.log1p(volume)))
+    bot_penalty = sum(r[5] for r in rows) / volume
+
+    # Normalize simple heuristics (quick min-max-ish scaling)
+    norm_volume = min(1.0, math.log1p(volume)/5.0)  # adjust denominator by historical baseline
+    norm_influencer = min(1.0, influencer_score/50.0)
+    norm_engagement = min(1.0, engagement_score/10.0)
+    positive_sentiment = max(0, avg_sentiment)
+    news_signal = 0.0  # placeholder
+
+    # weights (tune later)
+    w1,w2,w3,w4,w5,w6 = 0.30,0.20,0.20,0.15,0.10,0.25
+    raw = (w1*norm_volume + w2*norm_influencer + w3*norm_engagement + w4*positive_sentiment + w5*news_signal - w6*bot_penalty)
+    hype = max(0.0, min(1.0, raw))
+    nowstr = now.isoformat()
+    c.execute("""INSERT INTO hype_scores(ipo_id, window_start, window_end, volume, avg_sentiment, influencer_score, engagement_score, bot_penalty, hype_score, created_at)
+                 VALUES (?,?,?,?,?,?,?,?,?,?)""",
+              (ipo_id, start.isoformat(), now.isoformat(), volume, avg_sentiment, influencer_score, engagement_score, bot_penalty, hype, nowstr))
+    conn.commit()
+    conn.close()
+    return hype
+
+# ---------- Demo driver ----------
+def demo_run():
+    ensure_db()
+    # create a demo IPO
+    conn = sqlite3.connect(DB)
+    c = conn.cursor()
+    c.execute("INSERT INTO ipos(company, ticker, expected_date, created_at) VALUES (?,?,?,?)",
+              ("Acme Robotics", "ACMR", (datetime.utcnow()+timedelta(days=7)).date().isoformat(), datetime.utcnow().isoformat()))
+    ipo_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    ipo = {'id': ipo_id, 'company': 'Acme Robotics', 'ticker': 'ACMR'}
+    # ingest dummy posts
+    ingest_dummy_posts(ipo)
+    hype = compute_hype_for_ipo(ipo_id)
+    print(f"IPO {ipo['ticker']} Hype Score (0-1): {hype}")
+
+if __name__ == "__main__":
+    demo_run()
