@@ -1,42 +1,74 @@
 # streamlit_app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
-import altair as alt
+import requests
+import time
 from datetime import datetime, timedelta
+import altair as alt
 
-st.set_page_config(page_title="IPO Hype Dashboard", layout="wide")
-st.title("🚀 IPO Hype Dashboard (Demo)")
+# === CONFIG ===
+# Replace with your actual API key if required
+FINNHUB_API_KEY = "<YOUR_FINNHUB_API_KEY>"
 
-# --- Generate simple fake data ---
-np.random.seed(42)
-dates = pd.date_range(datetime.now() - timedelta(days=7), periods=50, freq="4H")
-data = pd.DataFrame({
-    "time": dates,
-    "ipo": np.random.choice(["Acme Robotics (ACMR)", "FinTechNow (FTNW)", "BioFuture (BIOF)"], size=len(dates)),
-    "hype_score": np.clip(np.random.normal(loc=50, scale=15, size=len(dates)), 0, 100)
-})
+def fetch_upcoming_ipos_finnhub(days=7):
+    """
+    Fetch upcoming IPOs via Finnhub API (free tier available).
+    Default fetches IPOs in the next `days` days.
+    """
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    future = (datetime.utcnow() + timedelta(days=days)).strftime("%Y-%m-%d")
+    url = (
+        f"https://finnhub.io/api/v1/calendar/ipo?"
+        f"from={today}&to={future}&token={FINNHUB_API_KEY}"
+    )
+    resp = requests.get(url)
+    if resp.status_code != 200:
+        st.error(f"Error fetching IPOs: {resp.status_code}")
+        return pd.DataFrame()
+    data = resp.json().get("ipoCalendar", [])
+    return pd.DataFrame(data)
 
-# --- Sidebar ---
-ipo_choice = st.sidebar.selectbox("Select IPO", ["All"] + sorted(data["ipo"].unique()))
+def main():
+    st.set_page_config(page_title="IPO Hype Dashboard - Upcoming IPOs", layout="wide")
+    st.title("IPO Hype Dashboard — Upcoming IPOs")
 
-if ipo_choice != "All":
-    df_plot = data[data["ipo"] == ipo_choice]
-else:
-    df_plot = data.groupby("time")["hype_score"].mean().reset_index()
-    df_plot["ipo"] = "All"
+    days = st.sidebar.slider("Days ahead to fetch IPOs", 1, 30, 7)
 
-# --- Chart ---
-chart = alt.Chart(df_plot).mark_line(point=True).encode(
-    x="time:T",
-    y=alt.Y("hype_score:Q", title="Hype Score (0–100)"),
-    color="ipo:N",
-    tooltip=["time:T", "ipo:N", "hype_score:Q"]
-).interactive()
+    with st.spinner("Fetching upcoming IPOs..."):
+        df = fetch_upcoming_ipos_finnhub(days=days)
 
-st.altair_chart(chart, use_container_width=True)
+    if df.empty:
+        st.info("No upcoming IPOs found or API returned no data.")
+        return
 
-# --- Latest metric ---
-latest = df_plot.sort_values("time").iloc[-1]
-st.metric("Latest Hype Score", f"{latest['hype_score']:.1f}")
+    # Display IPO table
+    st.subheader(f"Upcoming IPOs (Next {days} days)")
+    # Show key columns; adjust as needed
+    display_cols = ["symbol", "name", "date", "exchange"]
+    for col in display_cols:
+        if col not in df.columns:
+            df[col] = ""
+    st.dataframe(df[display_cols])
 
+    # Simple timeline chart — IPO count per day
+    df["date"] = pd.to_datetime(df["date"])
+    timeline = (
+        df.groupby(df["date"].dt.date).size()
+        .reset_index(name="count")
+        .rename(columns={"date": "IPO Date"})
+    )
+
+    chart = alt.Chart(timeline).mark_bar().encode(
+        x=alt.X("IPO Date:T"),
+        y=alt.Y("count:Q", title="Number of IPOs"),
+        tooltip=["IPO Date", "count"]
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+    # Auto-refresh every minute
+    st.sidebar.write("This page auto-refreshes every 60 seconds.")
+    time.sleep(60)
+    st.experimental_rerun()
+
+if __name__ == "__main__":
+    main()
